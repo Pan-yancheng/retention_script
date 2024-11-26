@@ -1,0 +1,142 @@
+#!/bin/bash
+
+NAMESPACE=$0
+POD=$1
+FILE_NAME=$2
+CLUSTER=$3
+
+POD_FILE_PATH="/tmp"
+SERVICE_FILE_PATH="/tmp"
+
+#arthas jar
+ARTHAS_JAR_PATH="tmp"
+ARTHAS_JAR_NAME="arthas-boot.jar"
+
+S3_ARTHAS_BUCKET="prd-sre-manager-arthas-aps1"
+
+S3_BUCKET_PATH="prd-pod-file-aps1"
+
+max_retries=3
+
+#pod dump
+service_pod_dir="$POD_FILE_PATH/$FILE_NAME"
+
+heapdump_retries=0
+arthas_thread_redirect_retries=0
+arthas_threadd_redirect_retries=0
+arthas_threadl_redirect_retries=0
+zip_retries=0
+
+#1. arthas jar sre-manaager pod
+cd "$ARTHAS_JAR_PATH" || exit
+if [ ! -f "$ARTHAS_JAR_NAME" ]; then
+    aws s3 cp s3://"$S3_ARTHAS_BUCKET"/"$ARTHAS_JAR_NAME" "$ARTHAS_JAR_PATH"/"$ARTHAS_JAR_NAME"
+    echo "jar"
+else
+    echo "jar sre-manager pod"
+fi
+
+kubectl cp ./"$ARTHAS_JAR_NAME" "$NAMESPACE"/"$POD":"$ARTHAS_JAR_PATH"/"$ARTHAS_JAR_NAME" --context "$CLUSTER"
+
+#2. kubectl exec pod
+kubectl exec -it "$POD" -n "$NAMESPACE" --context "$CLUSTER" -- /bin/bash
+
+#2.1 attach pid
+pid=$(pgrep -f server.jar)
+
+#2.2 dump
+cd "$POD_FILE_PATH" || exit
+if [ ! -d "$FILE_NAME" ]; then
+    mkdir "$FILE_NAME"
+fi
+
+#2.3 jmap dump
+cd "$service_pod_dir" || exit
+while [ $heapdump_retries -lt $max_retries ]; do
+    if [ ! -f "$FILE_NAME.hprof" ]; then
+        jmap -dump:live,format=b,file="$FILE_NAME".hprof "$pid"
+        let heapdump_retries+=1
+    fi
+done
+
+#2.4 arthas
+gnome-terminal -- bash -c "java -jar arthas-boot.jar $pid ; exec bash"
+
+#2.5 thread
+while [ $arthas_thread_redirect_retries -lt $max_retries ]; do
+    if [ ! -f "${FILE_NAME}_threadcmd_before_process.txt" ]; then
+          #arthas http api
+          curl -S -X POST http://localhost:8563/api -d '
+          {
+              "action":"exec",
+              "command":"thread"
+          }
+          ' >> ${FILE_NAME}_threadcmd_before_process.txt &
+          let arthas_thread_redirect_retries+=1
+    fi
+done
+
+file_context=$(cat "${FILE_NAME}_threadcmd_before_process.txt")
+new_context=$(echo "$file_context" | sed 's/},/},\n/g')
+echo "$new_context" > ${FILE_NAME}_threadcmd.txt
+rm "${FILE_NAME}_threadcmd_before_process.txt"
+
+#2.6 thread -d
+while [ $arthas_threadd_redirect_retries -lt $max_retries ]; do
+    if [ ! -f "${FILE_NAME}_thread-dcmd_before_process.txt" ]; then
+          #arthas http api
+          curl -S -X POST http://localhost:8563/api -d '
+          {
+              "action":"exec",
+              "command":"thread -d"
+          }
+          ' >> ${FILE_NAME}_thread-dcmd_before_process.txt &
+          let arthas_threadd_redirect_retries+=1
+    fi
+done
+
+file_context=$(cat "${FILE_NAME}_thread-dcmd_before_process.txt")
+new_context=$(echo "$file_context" | sed 's/},/},\n/g')
+echo "$new_context" > ${FILE_NAME}_thread-dcmd.txt
+rm "${FILE_NAME}_thread-dcmd_before_process.txt"
+
+#2.7 thread -l
+while [ $arthas_threadl_redirect_retries -lt $max_retries ]; do
+    if [ ! -f "${FILE_NAME}_thread-lcmd_before_process.txt" ]; then
+          #arthas http api
+          curl -S -X POST http://localhost:8563/api -d '
+          {
+              "action":"exec",
+              "command":"thread -l"
+          }
+          ' >> ${FILE_NAME}_thread-lcmd_before_process.txt &
+          let arthas_threadl_redirect_retries+=1
+    fi
+done
+
+file_context=$(cat "${FILE_NAME}_thread-lcmd_before_process.txt")
+new_context=$(echo "$file_context" | sed 's/},/},\n/g')
+echo "$new_context" > ${FILE_NAME}_thread-lcmd.txt
+rm "${FILE_NAME}_thread-lcmd_before_process.txt"
+
+#2.8 zip
+cd "$POD_FILE_PATH" || exit
+while [ $zip_retries -lt $max_retries ]; do
+    if [ ! -f "$FILE_NAME".zip ]; then
+        zip -q -r "$FILE_NAME".zip "$service_pod_dir"
+        let zip_retries+=1
+    fi
+done
+
+#2.9 exit pod
+exit
+
+#3. kubectl cp
+cd "$SERVICE_FILE_PATH" || exit
+kubectl cp "$NAMESPACE"/"$POD":"$POD_FILE_PATH"/"$FILE_NAME".zip ./"$FILE_NAME".zip --context "$CLUSTER"
+
+#4. aws s3 cp
+aws s3 cp "$FILE_NAME".zip s3://"$S3_BUCKET_PATH"/"$FILE_NAME".zip
+
+#5. sre-manager zip
+rm "$SERVICE_FILE_PATH"/"$FILE_NAME".zip
